@@ -1,0 +1,155 @@
+#!/usr/bin/env bash
+# jito-bam-autoclaim: claims Jito BAM Boost (JIP-31) rewards before the 10-epoch window closes.
+#
+# Asks the public Jito API which recent epochs still hold an unclaimed boost for your identity
+# and claims only those with the official jito-bam-boost-cli. Needs curl, python3 and flock.
+#
+#   jito-bam-autoclaim              claim everything that is open
+#   jito-bam-autoclaim --dry-run    only show what would be claimed
+#   jito-bam-autoclaim --epoch N    claim one epoch
+#
+# Settings: /etc/jito-bam-autoclaim.conf (see install.sh). Any of them can also be set in the environment.
+# https://github.com/dragon-dev7/jito-bam-autoclaim · MIT · by Dragon Trust (https://dragontrust.pro)
+set -uo pipefail
+
+CONF=${JITO_BAM_AUTOCLAIM_CONF:-/etc/jito-bam-autoclaim.conf}
+# shellcheck disable=SC1090
+[ -r "$CONF" ] && . "$CONF"
+
+RPC_URL=${RPC_URL:-https://api.mainnet-beta.solana.com}
+CLI_BIN=${CLI_BIN:-/opt/jito-bam-boost-cli/target/release/jito-bam-boost-cli}
+SIGNER=${SIGNER:-}
+WINDOW=${WINDOW:-10}
+TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+TELEGRAM_CHAT_ID=${TELEGRAM_CHAT_ID:-}
+PROGRAM=BoostxbPp2ENYHGcTLYt1obpcY13HE4NojdqNWdzqSSb
+API=https://kobe.mainnet.jito.network/api/v1/bam_boost_validators
+
+DRY=0; ONLY=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --dry-run) DRY=1 ;;
+    --epoch) ONLY=${2:-}; shift ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) echo "unknown option: $1" >&2; exit 2 ;;
+  esac
+  shift
+done
+
+log() { echo "[$(date -u +%FT%TZ)] $*"; }
+notify() {
+  [ -n "$TELEGRAM_BOT_TOKEN" ] && [ -n "$TELEGRAM_CHAT_ID" ] || return 0
+  curl -s -m 15 "https://api.telegram.org/bot${TELEGRAM_BOT_TOKEN}/sendMessage" \
+    --data-urlencode "chat_id=${TELEGRAM_CHAT_ID}" --data-urlencode "text=$*" >/dev/null || true
+}
+
+# Identity keypair of the running validator: the --identity argument of agave/solana/jito validator
+detect_signer() {
+  local pid exe a p i
+  for pid in $(pgrep -f 'agave-validator|solana-validator' 2>/dev/null); do
+    exe=$(basename "$(readlink -f "/proc/$pid/exe" 2>/dev/null)" 2>/dev/null)
+    case "$exe" in agave-validator|solana-validator) ;; *) continue ;; esac
+    mapfile -d '' args < "/proc/$pid/cmdline" 2>/dev/null || continue
+    for i in "${!args[@]}"; do
+      a=${args[$i]}; p=""
+      case "$a" in
+        --identity=*) p=${a#--identity=} ;;
+        --identity|-i) p=${args[$((i + 1))]:-} ;;
+      esac
+      [ -n "$p" ] || continue
+      [[ "$p" == /* ]] || p="$(readlink -f "/proc/$pid/cwd")/$p"
+      [ -f "$p" ] && { echo "$p"; return 0; }
+    done
+  done
+  return 1
+}
+
+exec 9>/tmp/jito-bam-autoclaim.lock
+flock -n 9 || { log "already running"; exit 0; }
+
+[ -x "$CLI_BIN" ] || { log "jito-bam-boost-cli not found at $CLI_BIN (run install.sh or set CLI_BIN)"; exit 1; }
+[ -n "$SIGNER" ] || SIGNER=$(detect_signer) || { log "identity keypair not found: set SIGNER in $CONF"; exit 1; }
+[ -r "$SIGNER" ] || { log "cannot read $SIGNER"; exit 1; }
+
+# Identity pubkey = base58 of the last 32 bytes of the keypair file
+ID=$(python3 - "$SIGNER" <<'PY'
+import json, sys
+b = bytes(json.load(open(sys.argv[1]))[32:])
+alphabet = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz'
+n, s = int.from_bytes(b, 'big'), ''
+while n:
+    n, r = divmod(n, 58)
+    s = alphabet[r] + s
+print('1' * (len(b) - len(b.lstrip(b'\0'))) + s)
+PY
+) || { log "cannot read identity from $SIGNER"; exit 1; }
+
+rpc() { curl -s -m 20 -H 'Content-Type: application/json' -d "$1" "$RPC_URL"; }
+
+CUR=$(rpc '{"jsonrpc":"2.0","id":1,"method":"getEpochInfo"}' \
+      | python3 -c 'import json,sys; print(json.load(sys.stdin)["result"]["epoch"])' 2>/dev/null) \
+      || { log "cannot get current epoch from $RPC_URL"; exit 1; }
+
+# "none" | "claimed" | "unclaimed <lamports> <claim_status_address>"
+status() {
+  curl -s -m 30 "$API?epoch=$1" | python3 -c '
+import json, sys
+rows = json.load(sys.stdin).get("bam_boost_validators") or []
+me = [r for r in rows if r.get("identity_account") == sys.argv[1]]
+if not me:
+    print("none")
+elif me[0]["claimed"]:
+    print("claimed")
+else:
+    print("unclaimed %d %s" % (me[0]["amount"], me[0]["claim_status_address"]))
+' "$ID"
+}
+
+# The claim-status account exists on chain = already claimed (the API can lag behind)
+on_chain() {
+  rpc "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"getAccountInfo\",\"params\":[\"$1\",{\"encoding\":\"base64\"}]}" \
+    | python3 -c 'import json,sys; sys.exit(0 if json.load(sys.stdin)["result"]["value"] else 1)' 2>/dev/null
+}
+
+jitosol() { python3 -c "print(f'{$1/1e9:.4f}')"; }
+
+if [ -n "$ONLY" ]; then FROM=$ONLY; TO=$ONLY; else FROM=$((CUR - WINDOW)); TO=$((CUR - 1)); fi
+claimed=0; seen=0
+
+for ((E = FROM; E <= TO; E++)); do
+  st=$(status "$E") || { log "epoch $E: Jito API error"; continue; }
+  read -r state amount cs <<<"$st"
+  [ "$state" = "none" ] && continue
+  seen=$((seen + 1))
+  [ "$state" = "claimed" ] && continue
+
+  if on_chain "$cs"; then
+    log "epoch $E: already claimed on chain"
+    continue
+  fi
+
+  if [ "$DRY" = 1 ]; then
+    log "epoch $E: would claim $(jitosol "$amount") JitoSOL (closes after epoch $((E + WINDOW)))"
+    continue
+  fi
+
+  log "epoch $E: claiming $(jitosol "$amount") JitoSOL"
+  ok=0
+  for try in 1 2 3; do
+    out=$("$CLI_BIN" bam-boost merkle-distributor claim --network mainnet --epoch "$E" --rpc-url "$RPC_URL" \
+          --signer "$SIGNER" --commitment confirmed --jito-bam-boost-program-id "$PROGRAM" 2>&1)
+    if grep -q "Transaction confirmed" <<<"$out"; then
+      tx=$(grep -oE 'Transaction confirmed: [A-Za-z0-9]+' <<<"$out" | awk '{print $3}')
+      log "epoch $E: CLAIMED tx=$tx"
+      notify "✅ BAM Boost epoch $E claimed: $(jitosol "$amount") JitoSOL https://solscan.io/tx/$tx"
+      claimed=$((claimed + 1)); ok=1
+      break
+    fi
+    if on_chain "$cs"; then log "epoch $E: already claimed"; ok=1; break; fi
+    log "epoch $E: attempt $try failed: $(grep -m1 -iE 'error' <<<"$out" | cut -c1-200)"
+    sleep 30
+  done
+  [ "$ok" = 1 ] || notify "⚠️ BAM Boost epoch $E: claim failed 3 times, will retry next run. Window closes after epoch $((E + WINDOW))."
+done
+
+log "identity $ID · epochs $FROM-$TO · with boost: $seen · claimed now: $claimed$([ "$DRY" = 1 ] && echo ' (dry run)')"
